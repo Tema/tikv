@@ -818,18 +818,13 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
                 record_all += record_len;
             }
 
-            // When max_keys_read is active, collect exec stats every iteration to
-            // accumulate the physical KV keys scanned via scanned_rows_per_range.
+            // When max_keys_read is active, peek at accumulated scanned rows without
+            // draining scanner state, so collect_exec_stats can still be called once
+            // at the end of the loop.
             // TODO: IndexLookUp plans don't populate it https://github.com/tikv/tikv/blob/030d7b4b4dc3211304cab22aa20cf4c566a68217/components/tidb_query_executors/src/index_lookup_executor.rs#L549
-            let mut exec_stats_collected = false;
             if self.max_keys_read.is_some() {
-                let prev_len = self.exec_stats.scanned_rows_per_range.len();
-                self.out_most_executor
-                    .collect_exec_stats(&mut self.exec_stats);
-                exec_stats_collected = true;
-                scanned_keys_total += self.exec_stats.scanned_rows_per_range[prev_len..]
-                    .iter()
-                    .sum::<usize>() as u64;
+                scanned_keys_total = self.out_most_executor
+                    .peek_scanned_rows_sum() as u64;
             }
 
             if chunk.has_rows_data() {
@@ -840,10 +835,8 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
                 || self.paging_size.is_some_and(|p| record_all >= p as usize)
                 || self.max_keys_read.is_some_and(|m| scanned_keys_total >= m)
             {
-                if !exec_stats_collected {
-                    self.out_most_executor
-                        .collect_exec_stats(&mut self.exec_stats);
-                }
+                self.out_most_executor
+                    .collect_exec_stats(&mut self.exec_stats);
                 tidb_query_common::metrics::record_coprocessor_executor_iterations(
                     self.exec_stats
                         .summary_per_executor
