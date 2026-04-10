@@ -68,8 +68,14 @@ pub trait BatchExecutor: Send {
     /// less than `next_batch()`.
     fn collect_exec_stats(&mut self, dest: &mut ExecuteStats);
 
-    /// Returns the total number of rows scanned, without modifying internal
-    /// state.
+    /// Returns the sum of rows scanned across all ranges since the last
+    /// `collect_exec_stats` call (or since construction if never collected),
+    /// without modifying internal state.
+    ///
+    /// `collect_exec_stats` drains the per-range counters, so this value
+    /// resets to zero after each collection. Callers that compare this
+    /// value against a budget (e.g. `max_keys_read`) must not call
+    /// `collect_exec_stats` until all such checks are done.
     fn peek_scanned_rows_sum(&self) -> usize;
 
     /// Collects underlying storage statistics accumulated during execution and

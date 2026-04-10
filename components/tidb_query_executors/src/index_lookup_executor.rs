@@ -115,6 +115,7 @@ where
     intermediate_channel_index: usize,
     table_scan_child_index: usize,
     table_scan_exec_summary: [ExecSummary; 1],
+    table_lookup_scanned_rows_per_range: Vec<usize>,
 }
 
 pub struct BuildIndexLookUpExecutorOptions<Src, Accessor> {
@@ -252,6 +253,7 @@ where
             intermediate_channel_index,
             table_scan_child_index,
             table_scan_exec_summary: [ExecSummary::default()],
+            table_lookup_scanned_rows_per_range: Vec::new(),
         }
     }
 
@@ -456,12 +458,16 @@ where
         let mut result = executor.next_batch(scan_rows).await;
         if let Ok(is_drained) = result.is_drained {
             if is_drained.stop() {
-                state
-                    .table_scan
-                    .as_mut()
-                    .unwrap()
-                    .summary_collector
+                let exec = state.table_scan.as_mut().unwrap();
+                exec.summary_collector
                     .collect(&mut self.table_scan_exec_summary);
+                let mut drain_stats = ExecuteStats {
+                    summary_per_executor: Vec::new(),
+                    scanned_rows_per_range: Vec::new(),
+                };
+                exec.inner.collect_exec_stats(&mut drain_stats);
+                self.table_lookup_scanned_rows_per_range
+                    .append(&mut drain_stats.scanned_rows_per_range);
                 state.table_scan = None;
                 result.is_drained = Ok(BatchExecIsDrain::Remain);
             }
@@ -544,14 +550,31 @@ where
         }) = &mut self.phase
         {
             exec.summary_collector.collect(&mut summary);
+            let mut live_stats = ExecuteStats {
+                summary_per_executor: Vec::new(),
+                scanned_rows_per_range: Vec::new(),
+            };
+            exec.inner.collect_exec_stats(&mut live_stats);
+            self.table_lookup_scanned_rows_per_range
+                .append(&mut live_stats.scanned_rows_per_range);
         }
         dest.summary_per_executor[self.table_scan_child_index] += summary[0];
-        // TODO: how to handle `scanned_rows_per_range`
+        dest.scanned_rows_per_range
+            .append(&mut self.table_lookup_scanned_rows_per_range);
     }
 
     #[inline]
     fn peek_scanned_rows_sum(&self) -> usize {
+        let live_table_scan_rows = match &self.phase {
+            IndexLookUpPhase::TableLookUp(TableLookUpState {
+                table_scan: Some(exec),
+                ..
+            }) => exec.peek_scanned_rows_sum(),
+            _ => 0,
+        };
         self.src.peek_scanned_rows_sum()
+            + self.table_lookup_scanned_rows_per_range.iter().sum::<usize>()
+            + live_table_scan_rows
     }
 
     #[inline]
@@ -2560,5 +2583,121 @@ pub mod tests {
         let summary = stats.summary_per_executor[index_lookup.table_scan_child_index];
         assert_eq!(7, summary.num_produced_rows);
         assert_eq!(2, summary.num_iterations);
+    }
+
+    #[test]
+    fn test_table_scan_scanned_rows_in_collect_exec_stats() {
+        // Verify that collect_exec_stats includes table-scan-side scanned rows
+        // in scanned_rows_per_range, not just the index-scan side.
+        let columns = int_handle_table_columns(vec![FieldTypeTp::LongLong], 0);
+        let src_results = build_int_array_results(vec![vec![1, 2, 3, 4, 5]]);
+        let mut index_lookup = new_index_lookup_executor_for_test(
+            EvalConfig::default_for_test(),
+            src_results,
+            Some(MockTableTaskIterBuilder),
+            int_handle_table_columns(vec![FieldTypeTp::LongLong, FieldTypeTp::String], 0),
+        );
+
+        // Trigger table scan phase.
+        assert_eq!(
+            BatchExecIsDrain::Remain,
+            block_on(index_lookup.next_batch(128)).is_drained.unwrap()
+        );
+
+        // First table task: 3 rows. Drain it completely.
+        let s = index_lookup.phase.mut_table_lookup_or_err().unwrap();
+        s.table_task_iter.as_mut().unwrap().expect_next_task(
+            columns.clone(),
+            vec![vec![Datum::I64(1), Datum::I64(2), Datum::I64(3)]],
+            vec![make_scan_key_range(i64::MIN, i64::MAX)],
+        );
+        assert_eq!(
+            BatchExecIsDrain::Remain,
+            block_on(index_lookup.next_batch(128)).is_drained.unwrap()
+        );
+        // Table scan executor drained — scanned rows should be accumulated.
+        let s = index_lookup.phase.mut_table_lookup_or_err().unwrap();
+        assert!(s.table_scan.is_none());
+
+        // Second table task: 2 rows. Drain it completely.
+        let s = index_lookup.phase.mut_table_lookup_or_err().unwrap();
+        s.table_task_iter.as_mut().unwrap().expect_next_task(
+            columns.clone(),
+            vec![vec![Datum::I64(4), Datum::I64(5)]],
+            vec![make_scan_key_range(i64::MIN, i64::MAX)],
+        );
+        assert_eq!(
+            BatchExecIsDrain::Remain,
+            block_on(index_lookup.next_batch(128)).is_drained.unwrap()
+        );
+
+        // Now collect exec stats — should include both index-scan and table-scan
+        // scanned rows.
+        let mut stats = ExecuteStats::new(index_lookup.table_scan_child_index + 2);
+        index_lookup.collect_exec_stats(&mut stats);
+        let total: usize = stats.scanned_rows_per_range.iter().sum();
+        // Index scan: 5 rows from MockExecutor. Table scan: 3 + 2 = 5 rows.
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn test_table_scan_peek_scanned_rows_sum() {
+        // Verify that peek_scanned_rows_sum includes both index-scan and
+        // table-scan sides, including the currently-live table scan executor.
+        let columns = int_handle_table_columns(vec![FieldTypeTp::LongLong], 0);
+        let src_results = build_int_array_results(vec![vec![1, 2, 3, 4, 5]]);
+        let mut index_lookup = new_index_lookup_executor_for_test(
+            EvalConfig::default_for_test(),
+            src_results,
+            Some(MockTableTaskIterBuilder),
+            int_handle_table_columns(vec![FieldTypeTp::LongLong, FieldTypeTp::String], 0),
+        );
+
+        // Before any scanning, peek should reflect index-scan pending rows.
+        assert_eq!(0, index_lookup.peek_scanned_rows_sum());
+
+        // Trigger table scan phase.
+        assert_eq!(
+            BatchExecIsDrain::Remain,
+            block_on(index_lookup.next_batch(128)).is_drained.unwrap()
+        );
+        // MockExecutor has 5 pending_scanned_rows after next_batch.
+        assert_eq!(5, index_lookup.peek_scanned_rows_sum());
+
+        // First table task: 5 rows. Read only 2, leaving executor alive.
+        let s = index_lookup.phase.mut_table_lookup_or_err().unwrap();
+        s.table_task_iter.as_mut().unwrap().expect_next_task(
+            columns.clone(),
+            vec![vec![
+                Datum::I64(1),
+                Datum::I64(2),
+                Datum::I64(3),
+                Datum::I64(4),
+                Datum::I64(5),
+            ]],
+            vec![make_scan_key_range(i64::MIN, i64::MAX)],
+        );
+        assert_eq!(
+            BatchExecIsDrain::Remain,
+            block_on(index_lookup.next_batch(2)).is_drained.unwrap()
+        );
+        let s = index_lookup.phase.mut_table_lookup_or_err().unwrap();
+        assert!(s.table_scan.is_some()); // still alive
+        // peek should include index-scan (5) + live table-scan rows (2 scanned so far).
+        assert!(
+            index_lookup.peek_scanned_rows_sum() >= 7,
+            "expected at least 7, got {}",
+            index_lookup.peek_scanned_rows_sum()
+        );
+
+        // Drain the rest of the table scan.
+        assert_eq!(
+            BatchExecIsDrain::Remain,
+            block_on(index_lookup.next_batch(128)).is_drained.unwrap()
+        );
+        let s = index_lookup.phase.mut_table_lookup_or_err().unwrap();
+        assert!(s.table_scan.is_none()); // drained
+        // peek should include index-scan (5) + accumulated table-scan (5).
+        assert_eq!(10, index_lookup.peek_scanned_rows_sum());
     }
 }

@@ -821,7 +821,6 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
             // When max_keys_read is active, peek at accumulated scanned rows without
             // draining scanner state, so collect_exec_stats can still be called once
             // at the end of the loop.
-            // TODO: IndexLookUp plans don't populate it https://github.com/tikv/tikv/blob/030d7b4b4dc3211304cab22aa20cf4c566a68217/components/tidb_query_executors/src/index_lookup_executor.rs#L549
             if self.max_keys_read.is_some() {
                 scanned_keys_total = self.out_most_executor
                     .peek_scanned_rows_sum() as u64;
