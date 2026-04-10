@@ -822,8 +822,7 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
             // draining scanner state, so collect_exec_stats can still be called once
             // at the end of the loop.
             if self.max_keys_read.is_some() {
-                scanned_keys_total = self.out_most_executor
-                    .peek_scanned_rows_sum() as u64;
+                scanned_keys_total = self.out_most_executor.peek_scanned_rows_sum() as u64;
             }
 
             if chunk.has_rows_data() {

@@ -573,7 +573,10 @@ where
             _ => 0,
         };
         self.src.peek_scanned_rows_sum()
-            + self.table_lookup_scanned_rows_per_range.iter().sum::<usize>()
+            + self
+                .table_lookup_scanned_rows_per_range
+                .iter()
+                .sum::<usize>()
             + live_table_scan_rows
     }
 
